@@ -107,8 +107,8 @@ pub struct RingBuffer<T> {
 
 // these implementations are required to access a ringbuffer in a separate
 // lifetime and thread using only a wrapping Arc.
-unsafe impl<T> marker::Send for RingBuffer<T> {}
-unsafe impl<T> marker::Sync for RingBuffer<T> {}
+unsafe impl<T: Send> marker::Send for RingBuffer<T> {}
+unsafe impl<T: Sync> marker::Sync for RingBuffer<T> {}
 
 impl<T> Default for RingBuffer<T> {
 	// this is convenient so we don't have to create 0 for atomics
