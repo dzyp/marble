@@ -204,6 +204,7 @@ impl<T> RingBuffer<T> {
 				}
 
 				if i == 10000 {
+					i = 0;
 					yield_now();
 				} else {
 					i += 1;
@@ -237,6 +238,7 @@ impl<T> RingBuffer<T> {
 				}
 
 				if i == 10000 {
+					i = 0;
 					yield_now();
 				} else {
 					i += 1;
