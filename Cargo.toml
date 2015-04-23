@@ -1,0 +1,4 @@
+[package]
+name = "marble"
+version = "0.1.0"
+authors = ["Dustin Hiatt <dustin.hiatt@workiva.com>"]
