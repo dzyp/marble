@@ -89,6 +89,7 @@ impl<T> Node<T> {
 /// Puts are blocked on a full queue and gets are blocked on an empty
 /// queue.  In either case, calling dispose will free any blocked threads
 /// and return an error.
+#[repr(C)]
 pub struct RingBuffer<T> {
 	queue: 	   AtomicUsize,
 	// padding is here to ensure that queue and dequeue end on different
