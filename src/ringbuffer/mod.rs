@@ -8,6 +8,10 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 //
+//! This buffer is similar to the buffer
+//! described here: http://www.1024cores.net/home/lock-free-algorithms/queues/bounded-mpmc-queue
+//! with some minor additions.
+//!
 //! A statically-sized ring buffer that acts as an MPMC queue.  Differs
 //! from the ring buffer-backed VecDeque in that this structure
 //! is lockless and threadsafe.  Threadsafety is achieved using only
@@ -88,7 +92,7 @@ impl<T> Node<T> {
 /// RingBuffer is a threadsafe MPMC queue that's statically-sized.
 /// Puts are blocked on a full queue and gets are blocked on an empty
 /// queue.  In either case, calling dispose will free any blocked threads
-/// and return an error.
+/// and return an error. 
 #[repr(C)]
 pub struct RingBuffer<T> {
 	queue: 	   AtomicUsize,
