@@ -465,6 +465,7 @@ mod rbtest {
         } else {
             run( |rb| b.iter( || {
                 let rb = rb.clone();
+                rb.put(1);
             }));
         }
 	}
