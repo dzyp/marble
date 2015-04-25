@@ -120,7 +120,7 @@ impl<T> Drop for RingBuffer<T> {
             self.positions.set_len(0);
             while start != end {
                 ptr::read((self.positions.get_unchecked(start)).item.get());
-                start = start.wrapping_add(1) &self.mask;
+                start = start.wrapping_add(1) & self.mask;
             }
         }
     }
@@ -161,7 +161,15 @@ impl<T> RingBuffer<T> {
 	/// costly modulo call.  To get the actual capacity of the ring buffer
 	/// call cap().
 	pub fn new(cap: usize) -> RingBuffer<T> {
-		let calculated_capacity = cap.next_power_of_two();
+		let calculated_capacity = if cap < 2 {
+            // This special case is necessary because of how we encode filled cells; in particular,
+            // we assume that x + 1 != x + capacity, since position = x + 1 means a cell is filled
+            // and the next cell we attempt to look at when calling put is at index (x + 1) & mask.
+            // It also can't be zero because mask = cap - 1.
+            2
+        } else {
+            cap.next_power_of_two()
+        };
 
         unsafe {
             // We really just want to use raw allocation, but unfortunately that isn't stable yet.
@@ -191,6 +199,7 @@ impl<T> RingBuffer<T> {
 	/// different than length, which returns the actual number of
 	/// items in the ring buffer.  If cap == len, then the ring
 	/// buffer is full.
+    #[inline]
 	pub fn cap(&self) -> usize {
         self.mask + 1
 	}
@@ -213,6 +222,7 @@ impl<T> RingBuffer<T> {
 	/// put will add item to the ring buffer.  If the ring buffer is full
 	/// this operation blocks until it can be put.  Returns an error if
 	/// this ring buffer is disposed.
+    #[inline]
 	pub fn put(&self, item: T) -> Result<(), RingBufferError> {
         let mut position = self.queue.load(Ordering::Relaxed);
         let mut i = 0;
@@ -358,7 +368,7 @@ mod rbtest {
 			_ => () 
 		}
 
-		let result = rb.put(3);
+		let result = rb.put(());
 		match result {
 			Ok(_) => panic!("Should return error."),
 			_ => ()
@@ -369,7 +379,7 @@ mod rbtest {
 	fn bench_rb_put(b: &mut Bencher) {
 		b.iter(|| {
 			let rb = RingBuffer::new(2);
-			rb.put(1);
+			rb.put(());
 		});
 	}
 
@@ -377,7 +387,7 @@ mod rbtest {
 	fn bench_rb_get(b: &mut Bencher) {
 		b.iter(|| {
 			let rb = RingBuffer::new(2);
-			rb.put(1);
+			rb.put(());
 			rb.get();
 		});
 	}
@@ -433,7 +443,7 @@ mod rbtest {
 
 	#[bench]
 	fn bench_rb_lifecycle(b: &mut Bencher) {
-        fn run<F>(iter: F) where F: FnOnce(&Arc<RingBuffer<i32>>) {
+        fn run<F>(iter: F) where F: FnOnce(&Arc<RingBuffer<()>>) {
             let rb = Arc::new(RingBuffer::new(1));
 
             let rbc = rb.clone();
@@ -459,13 +469,13 @@ mod rbtest {
             b.iter( || {
                 run( |rb| {
                     let rb = rb.clone();
-                    rb.put(1);
+                    rb.put(());
                 });
             });
         } else {
             run( |rb| b.iter( || {
                 let rb = rb.clone();
-                rb.put(1);
+                rb.put(());
             }));
         }
 	}
@@ -475,24 +485,24 @@ mod rbtest {
 		let rb = VecDeque::new();
 		let arc = Arc::new(Mutex::new(rb));
 
+        enum Msg { NoOp, Stop }
+
 		let clone = arc.clone();
 		thread::spawn(move || {
 			loop {
 				let mut rb = clone.lock().unwrap();
-				let result = rb.pop_front();
-				match result {
-					Some(x) => {if x == 2 { break }},
-					None => ()
+				if let Some(Msg::Stop) = rb.pop_front() {
+                    break
 				}
 			}
 		});
 
 		b.iter(|| {
 			let mut rb = arc.lock().unwrap();
-			rb.push_back(1);
+			rb.push_back(Msg::NoOp);
 		});
 
 		let mut rb = arc.lock().unwrap();
-		rb.push_back(2);
+		rb.push_back(Msg::Stop);
 	}
 }
