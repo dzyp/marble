@@ -135,16 +135,7 @@ impl<T> Default for RingBuffer<T> {
 	// this is convenient so we don't have to create 0 for atomics
 	// and empty arrays with every constructor call.
 	fn default() -> RingBuffer<T> {
-		RingBuffer{
-			queue:     ATOMIC_USIZE_INIT,
-			_padding0: [0;8],
-			dequeue:   ATOMIC_USIZE_INIT,
-			_padding1: [0;8],
-			disposed:  ATOMIC_BOOL_INIT,
-			_padding2: [0;8],
-			mask: 	   0,
-			positions: vec![],
-		}
+        RingBuffer::new(0)
 	}
 }
 
@@ -190,7 +181,6 @@ impl<T> RingBuffer<T> {
                 _padding2: [0;8],
                 mask: calculated_capacity-1,
                 positions: positions,
-                ..Default::default()
             }
         }
 	}
