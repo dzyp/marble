@@ -219,75 +219,62 @@ impl<T> RingBuffer<T> {
 		self.disposed.store(true, Ordering::Relaxed);
 	}
 
+    /// Convenience method shared by both get and put that ensures exclusive access to a node's
+    /// item.  If the ring buffer is full the operation blocks until it can be executed.  Returns
+    /// an error if this ring buffer is disposed.
+    fn with_unique<F,G,U>(&self, queue: &AtomicUsize, unlocked: F, op: G)
+                         -> Result<U, RingBufferError>
+        where F: Fn(usize) -> usize,
+              G: FnOnce(&Node<T>, usize) -> U,
+    {
+        let mut position = queue.load(Ordering::Relaxed);
+
+        while !self.disposed.load(Ordering::Relaxed) {
+            const MAX_SPINS: u16 = 10000;
+
+            let mut spins = MAX_SPINS - 1;
+            while spins != 0 {
+                unsafe {
+                    let n = self.positions.get_unchecked(position & self.mask);
+                    let next = position.wrapping_add(1);
+                    if n.position.load(Ordering::Acquire) == unlocked(position) {
+                        let old = queue.compare_and_swap(position, next, Ordering::Relaxed);
+                        if old == position {
+                            return Ok(op(n, next));
+                        }
+                    } else {
+                        position = queue.load(Ordering::Relaxed);
+                    }
+                }
+                spins -= 1;
+            }
+
+            yield_now();
+        }
+
+        Err(RingBufferError::Disposed)
+    }
+
 	/// put will add item to the ring buffer.  If the ring buffer is full
 	/// this operation blocks until it can be put.  Returns an error if
 	/// this ring buffer is disposed.
-    #[inline]
-	pub fn put(&self, item: T) -> Result<(), RingBufferError> {
-        let mut position = self.queue.load(Ordering::Relaxed);
-        let mut i = 0;
-
-        loop {
-            if self.disposed.load(Ordering::Relaxed) {
-                return Err(RingBufferError::Disposed);
-            }
-
-            let new_position = position.wrapping_add(1);
-            unsafe {
-                let n = self.positions.get_unchecked(position&self.mask);
-                if n.position.load(Ordering::Acquire) == position {
-                    if self.queue.compare_and_swap(position, new_position, Ordering::Relaxed) == position {
-                        ptr::write(n.item.get(), item);
-                        n.position.store(new_position, Ordering::Release);
-                        return Ok(());
-                    }
-                } else {
-                    position = self.queue.load(Ordering::Relaxed);
-                }
-            }
-
-            if i == 10000 {
-                i = 0;
-                yield_now();
-            } else {
-                i += 1;
-            }
-        }
+	pub fn put(&self, data: T) -> Result<(), RingBufferError> {
+        self.with_unique(&self.queue, |p| p, |n, p| unsafe {
+            ptr::write(n.item.get(), data);
+            n.position.store(p, Ordering::Release);
+        })
 	}
 
 	/// get retrieves the next item from the ring buffer.  This method blocks
 	/// if the ring buffer is empty until an item is placed.  Returns an error
 	/// if the ring buffer is disposed.
 	pub fn get(&self) -> Result<T, RingBufferError> {
-        let mut position = self.dequeue.load(Ordering::Relaxed);
-        let mut i = 0;
-        loop {
-            if self.disposed.load(Ordering::SeqCst) {
-                return Err(RingBufferError::Disposed);
-            }
-
-            let new_position = position.wrapping_add(1);
-            unsafe {
-                let n = self.positions.get_unchecked(position&self.mask);
-                if n.position.load(Ordering::Acquire) == new_position {
-                    if self.dequeue.compare_and_swap(position, new_position, Ordering::Relaxed) == position {
-                        let data = ptr::read(n.item.get());
-                        n.position.store(new_position.wrapping_add(self.mask), Ordering::Release);
-                        return Ok(data);
-                    }
-                } else {
-                    position = self.dequeue.load(Ordering::Relaxed);
-                }
-            }
-
-            if i == 10000 {
-                i = 0;
-                yield_now();
-            } else {
-                i += 1;
-            }
-        }
-	}
+        self.with_unique(&self.dequeue, |p| p.wrapping_add(1), |n, p| unsafe {
+            let data = ptr::read(n.item.get());
+            n.position.store(p.wrapping_add(self.mask), Ordering::Release);
+            data
+        })
+    }
 }
 
 #[cfg(test)]
