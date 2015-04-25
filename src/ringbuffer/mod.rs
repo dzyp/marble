@@ -234,17 +234,18 @@ impl<T> RingBuffer<T> {
 
             let mut spins = MAX_SPINS - 1;
             while spins != 0 {
-                unsafe {
-                    let n = self.positions.get_unchecked(position & self.mask);
+                let n = unsafe {
+                    // We know the index is in bounds because mask = cap - 1.
+                    self.positions.get_unchecked(position & self.mask)
+                };
+                if n.position.load(Ordering::Acquire) == unlocked(position) {
                     let next = position.wrapping_add(1);
-                    if n.position.load(Ordering::Acquire) == unlocked(position) {
-                        let old = queue.compare_and_swap(position, next, Ordering::Relaxed);
-                        if old == position {
-                            return Ok(op(n, next));
-                        }
-                    } else {
-                        position = queue.load(Ordering::Relaxed);
+                    let old = queue.compare_and_swap(position, next, Ordering::Relaxed);
+                    if old == position {
+                        return Ok(op(n, next));
                     }
+                } else {
+                    position = queue.load(Ordering::Relaxed);
                 }
                 spins -= 1;
             }
