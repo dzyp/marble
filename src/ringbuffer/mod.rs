@@ -57,15 +57,17 @@
 ///		}
 /// });
 ///
-/// rb.put(1);
+/// let _ = rb.put(1).unwrap();
 /// rb.dispose();
-/// join.join();
+/// join.join().ok().unwrap();
 /// ```
 
 use std::cell::UnsafeCell;
 use std::default::Default;
 use std::marker;
-use std::sync::atomic::{ATOMIC_USIZE_INIT, AtomicUsize, Ordering};
+use std::mem;
+use std::ptr;
+use std::sync::atomic::{ATOMIC_BOOL_INIT, ATOMIC_USIZE_INIT, AtomicBool, AtomicUsize, Ordering};
 use std::thread::yield_now;
 use std::vec::Vec;
 
@@ -74,17 +76,17 @@ use std::vec::Vec;
 // correct item.  This is achieved through the atomic position
 // field.
 struct Node<T> {
-	item: 	  Option<T>,
+	item: 	  UnsafeCell<T>,
 	position: AtomicUsize,
 }
 
 impl<T> Node<T> {
 	// new creates a new node with its atomic position set to
-	// position.  No item by default.
-	fn new(position: usize) -> Node<T> {
+	// position.  No item by default.  Unsafe because it uses uninitialized memory.
+	unsafe fn new(position: usize) -> Node<T> {
 		Node {
 			position: AtomicUsize::new(position),
-			item: None,
+			item: mem::uninitialized(),
 		}
 	}
 }
@@ -92,7 +94,7 @@ impl<T> Node<T> {
 /// RingBuffer is a threadsafe MPMC queue that's statically-sized.
 /// Puts are blocked on a full queue and gets are blocked on an empty
 /// queue.  In either case, calling dispose will free any blocked threads
-/// and return an error. 
+/// and return an error.
 #[repr(C)]
 pub struct RingBuffer<T> {
 	queue: 	   AtomicUsize,
@@ -101,13 +103,28 @@ pub struct RingBuffer<T> {
 	_padding0: [u64;8],
 	dequeue:   AtomicUsize,
 	_padding1: [u64;8],
-	disposed:  AtomicUsize,
+	disposed:  AtomicBool,
 	_padding2: [u64;8],
-	mask:      usize,
-	// positions is unsafecell so we can grab a node mutably in the
-	// put and get functions, which themselves can be called on an
-	// immutable ring buffer.
-	positions: UnsafeCell<Vec<Node<T>>>,
+	mask:	  usize,
+	positions: Vec<Node<T>>,
+}
+
+impl<T> Drop for RingBuffer<T> {
+	fn drop(&mut self) {
+		let mut start = self.queue.load(Ordering::Relaxed) & self.mask;
+		let end = self.dequeue.load(Ordering::Relaxed) & self.mask;
+		unsafe {
+			// Setting the length to 0 will prevent Vec from trying to run destructors for nodes
+			// that aren't actually initialized.  We free the elements explicitly instead.  We do
+			// it before dropping any elements in case dropping the element's destructor leads to a
+			// panic.
+			self.positions.set_len(0);
+			while start != end {
+				ptr::read((self.positions.get_unchecked(start)).item.get());
+				start = start.wrapping_add(1) & self.mask;
+			}
+		}
+	}
 }
 
 // these implementations are required to access a ringbuffer in a separate
@@ -119,22 +136,14 @@ impl<T> Default for RingBuffer<T> {
 	// this is convenient so we don't have to create 0 for atomics
 	// and empty arrays with every constructor call.
 	fn default() -> RingBuffer<T> {
-		RingBuffer{
-			queue:     ATOMIC_USIZE_INIT,
-			_padding0: [0;8],
-			dequeue:   ATOMIC_USIZE_INIT,
-			_padding1: [0;8],
-			disposed:  ATOMIC_USIZE_INIT,
-			_padding2: [0;8],
-			mask: 	   0,
-			positions: UnsafeCell::new(vec![]),
-		}
+		RingBuffer::new(0)
 	}
 }
 
 /// RingBufferError is returned when a thread gets or puts on a disposed
 /// RingBuffer.  Any blocked threads will be freed and will received this
 /// error.
+#[derive(Copy,Clone,Debug)]
 pub enum RingBufferError { Disposed }
 
 impl<T> RingBuffer<T> {
@@ -144,17 +153,36 @@ impl<T> RingBuffer<T> {
 	/// costly modulo call.  To get the actual capacity of the ring buffer
 	/// call cap().
 	pub fn new(cap: usize) -> RingBuffer<T> {
-		let calculated_capacity = cap.next_power_of_two();
-		let mut positions = Vec::<Node<T>>::with_capacity(calculated_capacity);
+		let calculated_capacity = if cap < 2 {
+			// This special case is necessary because of how we encode filled cells; in particular,
+			// we assume that x + 1 != x + capacity, since position = x + 1 means a cell is filled
+			// and the next cell we attempt to look at when calling put is at index (x + 1) & mask.
+			// It also can't be zero because mask = cap - 1.
+			2
+		} else {
+			cap.next_power_of_two()
+		};
 
-		for i in 0..calculated_capacity {
-			positions.push(Node::new(i as usize));
-		}
+		unsafe {
+			// We really just want to use raw allocation, but unfortunately that isn't stable yet.
+			let mut positions = Vec::with_capacity(calculated_capacity);
 
-		RingBuffer{
-			mask: calculated_capacity-1,
-			positions: UnsafeCell::new(positions),
-			..Default::default()
+			// It's important that this not panic, since it would lead to uninitialized memory
+			// being freed.
+			for i in 0..calculated_capacity {
+				positions.push(Node::new(i));
+			}
+
+			RingBuffer{
+				queue:	 ATOMIC_USIZE_INIT,
+				_padding0: [0;8],
+				dequeue:   ATOMIC_USIZE_INIT,
+				_padding1: [0;8],
+				disposed:  ATOMIC_BOOL_INIT,
+				_padding2: [0;8],
+				mask: calculated_capacity-1,
+				positions: positions,
+			}
 		}
 	}
 
@@ -162,94 +190,82 @@ impl<T> RingBuffer<T> {
 	/// different than length, which returns the actual number of
 	/// items in the ring buffer.  If cap == len, then the ring
 	/// buffer is full.
+	#[inline]
 	pub fn cap(&self) -> usize {
-		unsafe {
-			let positions = self.positions.get();
-			(*positions).len()
-		}
+		self.mask + 1
 	}
 
 	/// len returns the number of items in the ring buffer at this
 	/// moment.
 	pub fn len(&self) -> usize {
-		self.queue.load(Ordering::Relaxed) - self.dequeue.load(Ordering::Relaxed)
+		// Saturating subtract is required, because we might see a negative value here (there is no
+		// order dependency between the load of the queue length and dequeue length).
+		self.queue.load(Ordering::Relaxed).saturating_sub(self.dequeue.load(Ordering::Relaxed))
 	}
 
 	/// dispose frees any resources consumed by this ring buffer and
 	/// releases any threads that are currently in spin locks.  Any subsequent
 	/// calls to put or get will return an error.
 	pub fn dispose(&self) {
-		self.disposed.store(1, Ordering::Relaxed);
+		self.disposed.store(true, Ordering::Relaxed);
+	}
+
+	/// Convenience method shared by both get and put that ensures exclusive access to a node's
+	/// item.  If the ring buffer is full the operation blocks until it can be executed.  Returns
+	/// an error if this ring buffer is disposed.
+	fn with_unique<F,G,U>(&self, queue: &AtomicUsize, unlocked: F, op: G)
+						 -> Result<U, RingBufferError>
+		where F: Fn(usize) -> usize,
+			  G: FnOnce(&Node<T>, usize) -> U,
+	{
+		let mut position = queue.load(Ordering::Relaxed);
+
+		while !self.disposed.load(Ordering::Relaxed) {
+			const MAX_SPINS: u16 = 10000;
+
+			let mut spins = MAX_SPINS - 1;
+			while spins != 0 {
+				let n = unsafe {
+					// We know the index is in bounds because mask = cap - 1.
+					self.positions.get_unchecked(position & self.mask)
+				};
+				if n.position.load(Ordering::Acquire) == unlocked(position) {
+					let next = position.wrapping_add(1);
+					let old = queue.compare_and_swap(position, next, Ordering::Relaxed);
+					if old == position {
+						return Ok(op(n, next));
+					}
+				} else {
+					position = queue.load(Ordering::Relaxed);
+				}
+				spins -= 1;
+			}
+
+			yield_now();
+		}
+
+		Err(RingBufferError::Disposed)
 	}
 
 	/// put will add item to the ring buffer.  If the ring buffer is full
 	/// this operation blocks until it can be put.  Returns an error if
 	/// this ring buffer is disposed.
-	pub fn put(&self, item: T) -> Result<(), RingBufferError> {
-		unsafe {
-			let mut position = self.queue.load(Ordering::Relaxed);
-			let mut i = 0;
-
-			loop {
-				if self.disposed.load(Ordering::Relaxed) == 1 {
-					return Err(RingBufferError::Disposed);
-				}
-
-				let positions = self.positions.get();
-				let n = (*positions).get_unchecked_mut(position&self.mask);
-				let diff = n.position.load(Ordering::Acquire) - position;
-				if diff == 0 {
-					if self.queue.compare_and_swap(position, position+1, Ordering::Relaxed) == position {
-						n.item = Some(item);
-						n.position.store(position+1, Ordering::Release);
-						return Ok(());
-					}
-				} else {
-					position = self.queue.load(Ordering::Relaxed);
-				}
-
-				if i == 10000 {
-					i = 0;
-					yield_now();
-				} else {
-					i += 1;
-				}
-			}
-		}
+	pub fn put(&self, data: T) -> Result<(), RingBufferError> {
+		self.with_unique(&self.queue, |p| p, |n, p| unsafe {
+			ptr::write(n.item.get(), data);
+			n.position.store(p, Ordering::Release);
+		})
 	}
 
 	/// get retrieves the next item from the ring buffer.  This method blocks
 	/// if the ring buffer is empty until an item is placed.  Returns an error
 	/// if the ring buffer is disposed.
 	pub fn get(&self) -> Result<T, RingBufferError> {
-		unsafe {
-			let mut position = self.dequeue.load(Ordering::Relaxed);
-			let mut i = 0;
-			loop {
-				if self.disposed.load(Ordering::SeqCst) == 1 {
-					return Err(RingBufferError::Disposed);
-				}
-				let positions = self.positions.get();
-				let n = (*positions).get_unchecked_mut(position&self.mask);
-				let diff = n.position.load(Ordering::Acquire) - (position + 1);
-				if diff == 0 {
-					if self.dequeue.compare_and_swap(position, position+1, Ordering::Relaxed) == position {
-						let data = n.item.take().unwrap();
-						n.position.store(position+self.mask+1, Ordering::Release);
-						return Ok(data);
-					}
-				} else {
-					position = self.dequeue.load(Ordering::Relaxed);
-				}
-
-				if i == 10000 {
-					i = 0;
-					yield_now();
-				} else {
-					i += 1;
-				}
-			}
-		}
+		self.with_unique(&self.dequeue, |p| p.wrapping_add(1), |n, p| unsafe {
+			let data = ptr::read(n.item.get());
+			n.position.store(p.wrapping_add(self.mask), Ordering::Release);
+			data
+		})
 	}
 }
 
@@ -266,7 +282,7 @@ mod rbtest {
 	use std::sync::mpsc::channel;
 	use std::thread;
 
-    use super::*;
+	use super::*;
 
    	#[test]
 	fn test_simple_put_get() {
@@ -331,7 +347,7 @@ mod rbtest {
 			_ => () 
 		}
 
-		let result = rb.put(3);
+		let result = rb.put(());
 		match result {
 			Ok(_) => panic!("Should return error."),
 			_ => ()
@@ -342,7 +358,7 @@ mod rbtest {
 	fn bench_rb_put(b: &mut Bencher) {
 		b.iter(|| {
 			let rb = RingBuffer::new(2);
-			rb.put(1);
+			rb.put(());
 		});
 	}
 
@@ -350,7 +366,7 @@ mod rbtest {
 	fn bench_rb_get(b: &mut Bencher) {
 		b.iter(|| {
 			let rb = RingBuffer::new(2);
-			rb.put(1);
+			rb.put(());
 			rb.get();
 		});
 	}
@@ -419,9 +435,9 @@ mod rbtest {
 			}
 		});
 
-		b.iter(|| {
+		b.iter( || {
 			let rb = rb.clone();
-			rb.put(1);
+			rb.put(());
 		});
 
 		rb.dispose();
@@ -433,24 +449,24 @@ mod rbtest {
 		let rb = VecDeque::new();
 		let arc = Arc::new(Mutex::new(rb));
 
+		enum Msg { NoOp, Stop }
+
 		let clone = arc.clone();
 		thread::spawn(move || {
 			loop {
 				let mut rb = clone.lock().unwrap();
-				let result = rb.pop_front();
-				match result {
-					Some(x) => {if x == 2 { break }},
-					None => ()
+				if let Some(Msg::Stop) = rb.pop_front() {
+					break
 				}
 			}
 		});
 
 		b.iter(|| {
 			let mut rb = arc.lock().unwrap();
-			rb.push_back(1);
+			rb.push_back(Msg::NoOp);
 		});
 
 		let mut rb = arc.lock().unwrap();
-		rb.push_back(2);
+		rb.push_back(Msg::Stop);
 	}
 }
