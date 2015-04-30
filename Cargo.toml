@@ -2,3 +2,6 @@
 name = "marble"
 version = "0.1.0"
 authors = ["Dustin Hiatt <dustin.hiatt@workiva.com>"]
+
+[dependencies]
+num_cpus = "0.2.3"
