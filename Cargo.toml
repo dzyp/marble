@@ -5,3 +5,7 @@ authors = ["Dustin Hiatt <dustin.hiatt@workiva.com>"]
 
 [dependencies]
 num_cpus = "0.2.3"
+
+[dev-dependencies]
+quickcheck = "*"
+rand = "0.3"
